@@ -55,8 +55,8 @@ fn detect_provider(base_url: &str) -> Option<CodingPlanProvider> {
     } else if url.contains("volces.com/api/plan") || url.contains("volces.com/api/coding") {
         // 仅匹配 Agent Plan（/api/plan[/v3]）与 Coding Plan（/api/coding[/v3]）
         // 入口；DouBaoSeed 按量付费走 /api/v3 与 /api/compatible，没有套餐
-        // 额度，不在此命中。用量探测本身是双 plan 自动探测（GetAFPUsage →
-        // GetCodingPlanUsage），无需在此区分两种订阅。
+        // 额度，不在此命中。两种订阅的区分在 query_volcengine 内按入口路径路由
+        // （volcengine_plan_route），此处统一归为 Volcengine 即可。
         Some(CodingPlanProvider::Volcengine)
     } else {
         None
@@ -1170,14 +1170,52 @@ async fn query_command_code(api_key: &str) -> Result<SubscriptionQuota, String> 
 // 里另填火山账号的 AccessKey ID + Secret（与推理 Key 是两套凭据）。两个 plan 用
 // 同一份 AK/SK，故鉴权类错误直接停、不再试另一个 plan。
 //
-// 自动探测：先调 `GetAFPUsage`（Agent Plan，回绝对额度 Quota/Used），未订阅再调
-// `GetCodingPlanUsage`（Coding Plan，回百分比）。
+// 查询路由：数据面入口路径与套餐一一对应，按 provider 条目 `base_url` 决定调用
+// 哪个 plan 的用量接口——
+// - `/api/plan[/v3]`（Agent Plan 条目）→ 只调 `GetAFPUsage`
+// - `/api/coding[/v3]`（Coding Plan 条目）→ 只调 `GetCodingPlanUsage`
+// - 无法识别（自定义反代等）→ 自动探测：先 `GetAFPUsage`，未订阅再 `GetCodingPlanUsage`
+// 若不按入口路由，同时订阅两个套餐的账号在 Coding Plan 卡片上也会被先探测到的
+// Agent Plan 额度顶替（#6499）。
 
 /// 控制面 OpenAPI 统一网关（区别于数据面推理域名 ark.cn-beijing.volces.com）。
 const VOLCENGINE_OPENAPI_HOST: &str = "open.volcengineapi.com";
 const VOLCENGINE_API_VERSION: &str = "2024-01-01";
 /// ark 控制面 OpenAPI 的默认 Region（Agent/Coding Plan 目前在 cn-beijing）。
 const VOLCENGINE_DEFAULT_REGION: &str = "cn-beijing";
+
+/// 火山方舟用量查询按 provider 条目入口路径的路由结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolcPlanRoute {
+    /// `/api/plan` 入口：只查 Agent Plan（GetAFPUsage）。
+    AgentOnly,
+    /// `/api/coding` 入口：只查 Coding Plan（GetCodingPlanUsage）。
+    CodingOnly,
+    /// 无法识别的入口：保持 GetAFPUsage → GetCodingPlanUsage 双探兜底。
+    Auto,
+}
+
+/// 从数据面 `base_url` 认出该 provider 条目对应的套餐用量入口。
+/// 段边界匹配 `/api/plan`、`/api/coding`，避免 `/api/planner` 之类前缀误命中。
+fn volcengine_plan_route(base_url: &str) -> VolcPlanRoute {
+    let url = base_url.to_lowercase();
+    let after = |marker: &str| -> bool {
+        match url.find(marker) {
+            Some(i) => {
+                let rest = &url[i + marker.len()..];
+                rest.is_empty() || rest.starts_with('/')
+            }
+            None => false,
+        }
+    };
+    if after("/api/plan") {
+        VolcPlanRoute::AgentOnly
+    } else if after("/api/coding") {
+        VolcPlanRoute::CodingOnly
+    } else {
+        VolcPlanRoute::Auto
+    }
+}
 
 /// 单次 OpenAPI 调用的归类结果。
 enum VolcCall {
@@ -1563,61 +1601,82 @@ fn volcengine_auth_error(detail: String) -> SubscriptionQuota {
     }
 }
 
+/// 单个 plan 用量接口探测一次后的业务归类（在传输层 `VolcCall` 之上）。
+enum VolcProbe {
+    /// 解析出有效额度，查询完成。
+    Resolved(SubscriptionQuota),
+    /// 硬鉴权失败（两个 plan 共用凭据）——立即返回，不再试下一个。
+    Auth(SubscriptionQuota),
+    /// 瞬时传输失败——以 `Err` 传播，前端 retry 并保留上次成功值。
+    Transient(String),
+    /// 非鉴权 HTTP/解析错误——记录后可继续尝试下一个 plan。
+    Soft(String),
+    /// 签名通过但无任何可解析额度（未订阅 / 字段不符）——记录原始响应后继续。
+    Empty(String),
+}
+
+/// 探测单个 plan 用量接口（`GetAFPUsage` 或 `GetCodingPlanUsage`）。
+async fn volcengine_probe_plan(
+    region: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+    action: &str,
+) -> VolcProbe {
+    match volcengine_openapi_call(region, access_key_id, secret_access_key, action).await {
+        VolcCall::Auth(detail) => VolcProbe::Auth(volcengine_auth_error(detail)),
+        VolcCall::Transient(detail) => VolcProbe::Transient(detail),
+        VolcCall::Soft(detail) => VolcProbe::Soft(format!("{action}: {detail}")),
+        VolcCall::Body(body) => {
+            let result = body.get("Result").unwrap_or(&body);
+            let is_afp = action == "GetAFPUsage";
+            let tiers = if is_afp {
+                parse_afp_tiers(result)
+            } else {
+                parse_coding_plan_tiers(result)
+            };
+            if !tiers.is_empty() {
+                let plan = if is_afp {
+                    result
+                        .get("PlanType")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("Agent Plan {s}"))
+                } else {
+                    Some("Coding Plan".to_string())
+                };
+                return VolcProbe::Resolved(volcengine_success(tiers, plan));
+            }
+            // 截断原始响应用于诊断（区分"真没订阅"与"字段名/包裹层猜错"）。
+            let raw: String = body.to_string().chars().take(700).collect();
+            VolcProbe::Empty(format!("{action}={raw}"))
+        }
+    }
+}
+
 async fn query_volcengine(
     base_url: &str,
     access_key_id: &str,
     secret_access_key: &str,
 ) -> Result<SubscriptionQuota, String> {
     let region = volcengine_region(base_url);
-    let mut soft_errors: Vec<String> = Vec::new();
-    // 2xx + 无 Error 信封但解析不出额度时，截断原始响应用于诊断（区分"真没订阅"
-    // 与"字段名/包裹层猜错"）。签名若不通会走 Auth/Soft 分支，到不了这里。
-    let mut empty_responses: Vec<String> = Vec::new();
-    let summarize = |action: &str, body: &serde_json::Value| -> String {
-        let raw: String = body.to_string().chars().take(700).collect();
-        format!("{action}={raw}")
+    // 按 provider 条目入口路由：plan/coding 入口只查对应套餐，避免同时订阅两个套餐时
+    // Coding Plan 卡片被先探测到的 Agent Plan 额度顶替（#6499）。无法识别才双探兜底。
+    let plan_actions: &[&str] = match volcengine_plan_route(base_url) {
+        VolcPlanRoute::AgentOnly => &["GetAFPUsage"],
+        VolcPlanRoute::CodingOnly => &["GetCodingPlanUsage"],
+        VolcPlanRoute::Auto => &["GetAFPUsage", "GetCodingPlanUsage"],
     };
 
-    // 1) Agent Plan：GetAFPUsage
-    match volcengine_openapi_call(&region, access_key_id, secret_access_key, "GetAFPUsage").await {
-        VolcCall::Auth(detail) => return Ok(volcengine_auth_error(detail)),
-        VolcCall::Transient(detail) => return Err(format!("GetAFPUsage: {detail}")),
-        VolcCall::Soft(detail) => soft_errors.push(format!("GetAFPUsage: {detail}")),
-        VolcCall::Body(body) => {
-            let result = body.get("Result").unwrap_or(&body);
-            let tiers = parse_afp_tiers(result);
-            if !tiers.is_empty() {
-                let plan = result
-                    .get("PlanType")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| format!("Agent Plan {s}"));
-                return Ok(volcengine_success(tiers, plan));
-            }
-            empty_responses.push(summarize("GetAFPUsage", &body));
-        }
-    }
-
-    // 2) Coding Plan：GetCodingPlanUsage
-    match volcengine_openapi_call(
-        &region,
-        access_key_id,
-        secret_access_key,
-        "GetCodingPlanUsage",
-    )
-    .await
-    {
-        VolcCall::Auth(detail) => return Ok(volcengine_auth_error(detail)),
-        VolcCall::Transient(detail) => return Err(format!("GetCodingPlanUsage: {detail}")),
-        VolcCall::Soft(detail) => soft_errors.push(format!("GetCodingPlanUsage: {detail}")),
-        VolcCall::Body(body) => {
-            let result = body.get("Result").unwrap_or(&body);
-            let tiers = parse_coding_plan_tiers(result);
-            if !tiers.is_empty() {
-                return Ok(volcengine_success(tiers, Some("Coding Plan".to_string())));
-            }
-            empty_responses.push(summarize("GetCodingPlanUsage", &body));
+    let mut soft_errors: Vec<String> = Vec::new();
+    let mut empty_responses: Vec<String> = Vec::new();
+    for action in plan_actions {
+        match volcengine_probe_plan(&region, access_key_id, secret_access_key, action).await {
+            VolcProbe::Resolved(quota) => return Ok(quota),
+            VolcProbe::Auth(quota) => return Ok(quota),
+            VolcProbe::Transient(detail) => return Err(format!("{action}: {detail}")),
+            VolcProbe::Soft(detail) => soft_errors.push(detail),
+            VolcProbe::Empty(raw) => empty_responses.push(raw),
         }
     }
 
@@ -1815,9 +1874,9 @@ mod tests {
         detect_provider, parse_afp_tiers, parse_coding_plan_tiers, parse_command_code_quota,
         parse_minimax_tiers, parse_opencode_go_tiers, parse_zhipu_token_tiers,
         query_command_code_at, query_zhipu_team_at, volcengine_canonical_query,
-        volcengine_is_auth_error_code, volcengine_region, volcengine_response_error,
-        volcengine_sign, zhipu_quota_base, CodingPlanProvider, CredentialStatus, TIER_FIVE_HOUR,
-        TIER_MONTHLY, TIER_WEEKLY_LIMIT,
+        volcengine_is_auth_error_code, volcengine_plan_route, volcengine_region,
+        volcengine_response_error, volcengine_sign, zhipu_quota_base, CodingPlanProvider,
+        CredentialStatus, VolcPlanRoute, TIER_FIVE_HOUR, TIER_MONTHLY, TIER_WEEKLY_LIMIT,
     };
     use serde_json::json;
 
@@ -2856,6 +2915,44 @@ mod tests {
         assert_eq!(
             volcengine_region("https://example.com/api/coding"),
             "cn-beijing"
+        );
+    }
+
+    #[test]
+    fn volcengine_plan_route_by_entry_path() {
+        // Agent Plan 数据面入口只查 GetAFPUsage。
+        assert_eq!(
+            volcengine_plan_route("https://ark.cn-beijing.volces.com/api/plan"),
+            VolcPlanRoute::AgentOnly
+        );
+        assert_eq!(
+            volcengine_plan_route("https://ark.cn-beijing.volces.com/api/plan/v3"),
+            VolcPlanRoute::AgentOnly
+        );
+        // Coding Plan 数据面入口只查 GetCodingPlanUsage —— 同时订阅两个套餐时，
+        // 不能再被先探测到的 Agent Plan 额度顶替（#6499）。
+        assert_eq!(
+            volcengine_plan_route("https://ark.cn-beijing.volces.com/api/coding"),
+            VolcPlanRoute::CodingOnly
+        );
+        assert_eq!(
+            volcengine_plan_route("https://ark.cn-beijing.volces.com/api/coding/v3"),
+            VolcPlanRoute::CodingOnly
+        );
+        // 大小写不敏感。
+        assert_eq!(
+            volcengine_plan_route("https://ark.cn-beijing.volces.com/API/PLAN/v3"),
+            VolcPlanRoute::AgentOnly
+        );
+        // 段边界：/api/planner 之类前缀不得误判为 plan 入口。
+        assert_eq!(
+            volcengine_plan_route("https://example.com/api/planner"),
+            VolcPlanRoute::Auto
+        );
+        // 自定义反代等无法识别入口：保持原有 GetAFPUsage → GetCodingPlanUsage 兜底。
+        assert_eq!(
+            volcengine_plan_route("https://my-proxy.example.test/volc"),
+            VolcPlanRoute::Auto
         );
     }
 
